@@ -18,6 +18,11 @@ type (
 	PacketSniffer = func(ctx context.Context, metadata *adapter.InboundContext, packet []byte) error
 )
 
+// Sniffers run sequentially and share a single reader over one immutable
+// snapshot of the buffered payload. Do not run them concurrently: a
+// successful sniffer returns immediately and cancels the context while the
+// other goroutines may still be reading, which previously led to rare
+// nil-pointer panics inside the sniffers (e.g. sniff.BitTorrent).
 func PeekStream(ctx context.Context, metadata *adapter.InboundContext, conn net.Conn, buffer *buf.Buffer, timeout time.Duration, sniffers ...StreamSniffer) error {
 	if timeout == 0 {
 		timeout = C.ReadPayloadTimeout
@@ -38,58 +43,26 @@ func PeekStream(ctx context.Context, metadata *adapter.InboundContext, conn net.
 			}
 			return E.Cause(err, "read payload")
 		}
-		snifferCounts := len(sniffers)
-		errorsChan := make(chan error, len(sniffers))
-		fastClose, cancel := context.WithCancel(ctx)
+		payload := buffer.Bytes()
 		for _, sniffer := range sniffers {
-			go func(sniffer StreamSniffer) {
-				errorsChan <- sniffer(fastClose, metadata, bytes.NewReader(buffer.Bytes()))
-			}(sniffer)
-		}
-		for i := 0; i < snifferCounts; i++ {
-			err := <-errorsChan
+			err = sniffer(ctx, metadata, bytes.NewReader(payload))
 			if err == nil {
-				go func(index int) {
-					for i := index; i < snifferCounts; i++ {
-						<-errorsChan
-					}
-					close(errorsChan)
-				}(i + 1)
-				cancel()
 				return nil
 			}
 			errors = append(errors, err)
 		}
-		close(errorsChan)
-		cancel()
 	}
 	return E.Errors(errors...)
 }
 
 func PeekPacket(ctx context.Context, metadata *adapter.InboundContext, packet []byte, sniffers ...PacketSniffer) error {
 	var errors []error
-	snifferCounts := len(sniffers)
-	errorsChan := make(chan error, len(sniffers))
-	fastClose, cancel := context.WithCancel(ctx)
-	defer cancel()
 	for _, sniffer := range sniffers {
-		go func(sniffer PacketSniffer) {
-			errorsChan <- sniffer(fastClose, metadata, packet)
-		}(sniffer)
-	}
-	for i := 0; i < snifferCounts; i++ {
-		err := <-errorsChan
+		err := sniffer(ctx, metadata, packet)
 		if err == nil {
-			go func(index int) {
-				for i := index; i < snifferCounts; i++ {
-					<-errorsChan
-				}
-				close(errorsChan)
-			}(i + 1)
 			return nil
 		}
 		errors = append(errors, err)
 	}
-	close(errorsChan)
 	return E.Errors(errors...)
 }
